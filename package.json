@@ -1,0 +1,59 @@
+{
+  "name": "pi-model-error-auto-resume",
+  "version": "0.1.0",
+  "description": "Automatically resume recoverable failed model turns in the Pi coding agent",
+  "type": "module",
+  "license": "MIT",
+  "author": "Haiyang Ma",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/HaiYangMa13/pi-model-error-auto-resume.git"
+  },
+  "homepage": "https://github.com/HaiYangMa13/pi-model-error-auto-resume#readme",
+  "bugs": {
+    "url": "https://github.com/HaiYangMa13/pi-model-error-auto-resume/issues"
+  },
+  "keywords": [
+    "pi-package",
+    "pi-coding-agent",
+    "pi-extension",
+    "model",
+    "retry",
+    "resume",
+    "error-recovery"
+  ],
+  "files": [
+    "extensions",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions/model-error-auto-resume.ts"
+    ]
+  },
+  "scripts": {
+    "check": "tsc --noEmit",
+    "test": "node --import tsx --test tests/*.test.ts",
+    "verify": "npm run check && npm test && npm pack --dry-run",
+    "prepublishOnly": "npm run check && npm test"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "^0.84.1",
+    "@earendil-works/pi-coding-agent": "^0.84.1",
+    "@types/node": "^24.0.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
