@@ -1,6 +1,6 @@
 {
   "name": "pi-model-error-auto-resume",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Automatically resume recoverable failed model turns in the Pi coding agent",
   "type": "module",
   "license": "MIT",

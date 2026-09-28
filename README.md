@@ -12,10 +12,11 @@ Provider streams can fail after the model has produced partial text or partially
 
 - Waits for Pi's built-in retries, compaction, and queued follow-ups to finish.
 - Retries only recoverable model errors.
+- Never resumes when the turn was aborted or interrupted by the user (via Escape key, client cancellation, or proxy disconnect).
+- Cancels a scheduled resume immediately when the user presses Escape / Ctrl+C, sends a real prompt, runs a bash command, switches models, or switches sessions.
 - Skips context overflow, authentication, permission, quota, billing, invalid request, unavailable model, and safety-policy errors.
 - Uses bounded exponential delays: 3s, 6s, and 12s.
 - Stops after three automatic resume attempts.
-- Cancels a scheduled resume when the user sends a real prompt.
 - Cancels timers when the session shuts down or switches.
 - Adds `/model-resume` controls and a temporary footer status.
 - Has no runtime dependencies beyond Pi's bundled extension APIs.
@@ -71,6 +72,7 @@ A normal successful assistant response resets the attempt counter. Repeated fail
 
 The classifier intentionally avoids errors that usually need user action or configuration changes, including:
 
+- user interruption, abort, cancellation, or termination (e.g. `Operation aborted`, `terminated`, `User interrupted`, `context canceled`)
 - context or prompt length overflow
 - invalid, missing, or expired credentials
 - HTTP 401/403 authentication and permission failures

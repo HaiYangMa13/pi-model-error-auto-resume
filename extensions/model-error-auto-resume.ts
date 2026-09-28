@@ -50,10 +50,39 @@ const NON_RECOVERABLE_ERROR_PATTERNS = [
 	/(?:content policy|safety policy|safety filter|request was blocked|content was blocked)/i,
 ];
 
+export const USER_INTERRUPT_PATTERNS = [
+	/\b(?:user\s+)?abort(?:ed|ing|s)?\b/i,
+	/\babort\b/i,
+	/\b(?:user\s+)?interrupt(?:ed|ing|s)?\b/i,
+	/\b(?:user\s+)?cancel(?:led|ed|ing|s|lations?)?\b/i,
+	/\bterminated\b/i,
+	/\bclient\s+(?:closed|disconnected|aborted|cancelled|canceled)\b/i,
+	/\b(?:closed|terminated|aborted)\s+by\s+(?:client|user)\b/i,
+	/\b(?:sigint|sigterm)\b/i,
+	/\bcontext\s+cancel(?:ed|led)\b/i,
+];
+
 interface PendingModelError {
 	errorMessage: string;
 	provider?: string;
 	model?: string;
+}
+
+export function isUserInterruptError(errorMessage: string | undefined): boolean {
+	if (!errorMessage) return false;
+	const text = errorMessage.trim();
+	if (!text) return false;
+	return USER_INTERRUPT_PATTERNS.some((pattern) => pattern.test(text));
+}
+
+export function isTerminalInterruptKey(data: string): boolean {
+	return (
+		data === "\x1b" ||
+		data === "\x03" ||
+		data === "\x1b[27u" ||
+		data === "\x1b[27;1;27~" ||
+		/^\x1b\[(?:27(?:;\d+)?|1;1)u$/.test(data)
+	);
 }
 
 export function isRecoverableModelError(message: AssistantMessage, contextWindow: number): boolean {
@@ -62,6 +91,7 @@ export function isRecoverableModelError(message: AssistantMessage, contextWindow
 
 	const errorMessage = message.errorMessage?.trim();
 	if (!errorMessage) return true;
+	if (isUserInterruptError(errorMessage)) return false;
 	return !NON_RECOVERABLE_ERROR_PATTERNS.some((pattern) => pattern.test(errorMessage));
 }
 
@@ -81,13 +111,34 @@ export default function (pi: ExtensionAPI) {
 	let resumeTimer: ReturnType<typeof setTimeout> | undefined;
 	let scheduledLeafId: string | null | undefined;
 	let scheduleGeneration = 0;
+	let userInterrupted = false;
+	let terminalInputUnsubscribe: (() => void) | undefined;
+	let watchedSignal: AbortSignal | undefined;
+	let signalAbortHandler: (() => void) | undefined;
+	let continuationInFlight = false;
 
 	const clearStatus = (ctx: ExtensionContext) => {
 		ctx.ui.setStatus(STATUS_ID, undefined);
 	};
 
+	const cleanupTerminalInput = () => {
+		if (terminalInputUnsubscribe) {
+			terminalInputUnsubscribe();
+			terminalInputUnsubscribe = undefined;
+		}
+	};
+
+	const cleanupSignalWatcher = () => {
+		if (watchedSignal && signalAbortHandler) {
+			watchedSignal.removeEventListener("abort", signalAbortHandler);
+		}
+		watchedSignal = undefined;
+		signalAbortHandler = undefined;
+	};
+
 	const cancelScheduled = (ctx: ExtensionContext, clearPending = true) => {
 		scheduleGeneration++;
+		cleanupTerminalInput();
 		if (resumeTimer) {
 			clearTimeout(resumeTimer);
 			resumeTimer = undefined;
@@ -100,7 +151,44 @@ export default function (pi: ExtensionAPI) {
 	const resetAfterProgress = (ctx: ExtensionContext) => {
 		cancelScheduled(ctx);
 		resumeAttempts = 0;
+		userInterrupted = false;
 	};
+
+	const watchSignal = (ctx: ExtensionContext) => {
+		const signal = ctx.signal;
+		if (!signal) return;
+		if (signal === watchedSignal) return;
+
+		cleanupSignalWatcher();
+		watchedSignal = signal;
+
+		if (signal.aborted) {
+			userInterrupted = true;
+			cancelScheduled(ctx);
+			resumeAttempts = 0;
+			return;
+		}
+
+		signalAbortHandler = () => {
+			userInterrupted = true;
+			cancelScheduled(ctx);
+			resumeAttempts = 0;
+		};
+		signal.addEventListener("abort", signalAbortHandler, { once: true });
+	};
+
+	pi.on("turn_start", (_event, ctx) => {
+		if (!continuationInFlight) {
+			cancelScheduled(ctx);
+			userInterrupted = false;
+		}
+		continuationInFlight = false;
+		watchSignal(ctx);
+	});
+
+	pi.on("message_start", (_event, ctx) => {
+		watchSignal(ctx);
+	});
 
 	// message_end catches finalized assistant errors even when no useful content
 	// or tool call was produced in that turn.
@@ -108,8 +196,30 @@ export default function (pi: ExtensionAPI) {
 		if (event.message.role !== "assistant") return;
 
 		const message: AssistantMessage = event.message;
+
+		if (message.stopReason === "aborted") {
+			userInterrupted = true;
+			cancelScheduled(ctx);
+			resumeAttempts = 0;
+			return;
+		}
+
+		if (userInterrupted || ctx.signal?.aborted) {
+			userInterrupted = true;
+			cancelScheduled(ctx);
+			resumeAttempts = 0;
+			return;
+		}
+
 		if (message.stopReason !== "error") {
 			resetAfterProgress(ctx);
+			return;
+		}
+
+		if (isUserInterruptError(message.errorMessage)) {
+			userInterrupted = true;
+			cancelScheduled(ctx);
+			resumeAttempts = 0;
 			return;
 		}
 
@@ -126,9 +236,44 @@ export default function (pi: ExtensionAPI) {
 		};
 	});
 
+	pi.on("turn_end", (event, ctx) => {
+		if (
+			ctx.signal?.aborted ||
+			(event.message.role === "assistant" && event.message.stopReason === "aborted")
+		) {
+			userInterrupted = true;
+			cancelScheduled(ctx);
+			resumeAttempts = 0;
+		}
+	});
+
+	pi.on("agent_end", (event, ctx) => {
+		if (
+			ctx.signal?.aborted ||
+			event.messages.some(
+				(m) =>
+					m.role === "assistant" &&
+					(m.stopReason === "aborted" || isUserInterruptError(m.errorMessage)),
+			)
+		) {
+			userInterrupted = true;
+			cancelScheduled(ctx);
+			resumeAttempts = 0;
+		}
+	});
+
 	// Pi emits agent_settled only after its own retry, compaction, and queued
 	// continuation work has finished. Waiting for it prevents competing retries.
 	pi.on("agent_settled", (_event, ctx) => {
+		cleanupSignalWatcher();
+
+		if (userInterrupted || ctx.signal?.aborted) {
+			cancelScheduled(ctx);
+			resumeAttempts = 0;
+			userInterrupted = false;
+			return;
+		}
+
 		if (!enabled || !pendingError || resumeTimer || !ctx.isIdle()) return;
 
 		if (resumeAttempts >= MAX_RESUME_ATTEMPTS) {
@@ -156,14 +301,32 @@ export default function (pi: ExtensionAPI) {
 			"warning",
 		);
 
+		// Cancel scheduled resume immediately if the user sends an interrupt key (Escape or Ctrl+C).
+		cleanupTerminalInput();
+		if (typeof ctx.ui?.onTerminalInput === "function") {
+			terminalInputUnsubscribe = ctx.ui.onTerminalInput((data: string) => {
+				if (isTerminalInterruptKey(data)) {
+					userInterrupted = true;
+					cancelScheduled(ctx);
+					resumeAttempts = 0;
+					ctx.ui.notify("Scheduled model resume cancelled", "info");
+					return { consume: true };
+				}
+				return undefined;
+			});
+		}
+
 		resumeTimer = setTimeout(() => {
 			resumeTimer = undefined;
+			cleanupTerminalInput();
 			clearStatus(ctx);
 
-			// Never inject a continuation into a branch that changed while waiting.
+			// Never inject a continuation into a branch that changed while waiting,
+			// or if the turn was cancelled by user action.
 			if (
 				generation !== scheduleGeneration ||
 				!enabled ||
+				userInterrupted ||
 				!ctx.isIdle() ||
 				ctx.sessionManager.getLeafId() !== scheduledLeafId
 			) {
@@ -175,6 +338,7 @@ export default function (pi: ExtensionAPI) {
 			resumeAttempts = nextAttempt;
 			pendingError = undefined;
 			scheduledLeafId = undefined;
+			continuationInFlight = true;
 
 			pi.sendMessage(
 				{
@@ -204,6 +368,7 @@ export default function (pi: ExtensionAPI) {
 
 		if (action === "off") {
 			enabled = false;
+			userInterrupted = true;
 			cancelScheduled(ctx);
 			resumeAttempts = 0;
 			ctx.ui.notify("Model error auto resume disabled for this session", "info");
@@ -211,6 +376,7 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		if (action === "cancel") {
+			userInterrupted = true;
 			cancelScheduled(ctx);
 			resumeAttempts = 0;
 			ctx.ui.notify("Scheduled model resume cancelled", "info");
@@ -238,13 +404,48 @@ export default function (pi: ExtensionAPI) {
 
 	// A real user prompt always wins over a delayed automatic continuation.
 	pi.on("input", (event, ctx) => {
-		if (event.source !== "extension" && (resumeTimer || pendingError)) {
+		if (event.source !== "extension") {
+			userInterrupted = true;
 			cancelScheduled(ctx);
 			resumeAttempts = 0;
 		}
 	});
 
-	pi.on("session_shutdown", (_event, ctx) => {
+	pi.on("user_bash", (_event, ctx) => {
+		userInterrupted = true;
 		cancelScheduled(ctx);
+		resumeAttempts = 0;
+	});
+
+	pi.on("model_select", (_event, ctx) => {
+		cancelScheduled(ctx);
+		resumeAttempts = 0;
+	});
+
+	pi.on("session_before_switch", (_event, ctx) => {
+		cancelScheduled(ctx);
+		resumeAttempts = 0;
+	});
+
+	pi.on("session_before_fork", (_event, ctx) => {
+		cancelScheduled(ctx);
+		resumeAttempts = 0;
+	});
+
+	pi.on("session_before_compact", (_event, ctx) => {
+		cancelScheduled(ctx);
+		resumeAttempts = 0;
+	});
+
+	pi.on("session_before_tree", (_event, ctx) => {
+		cancelScheduled(ctx);
+		resumeAttempts = 0;
+	});
+
+	pi.on("session_shutdown", (_event, ctx) => {
+		cleanupSignalWatcher();
+		cleanupTerminalInput();
+		cancelScheduled(ctx);
+		resumeAttempts = 0;
 	});
 }
